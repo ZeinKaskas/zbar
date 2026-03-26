@@ -76,6 +76,17 @@ try {
     $success["ScheduledTask_schtasks"] = $false
 }
 
+# Watchdog task
+try {
+    Unregister-ScheduledTask -TaskName "zbar-watchdog" -Confirm:$false -ErrorAction Stop
+    Log "  [OK] Watchdog task removed." "Green"
+} catch {
+    Log "  [INFO] No watchdog task to remove." "Yellow"
+}
+try {
+    & schtasks /delete /tn "zbar-watchdog" /f 2>&1 | Out-Null
+} catch {}
+
 # ============================================================
 # STEP 2: Remove HKCU Registry Run entry
 # ============================================================
@@ -240,6 +251,12 @@ Log "  --- Deleting Install Directory ---" "Cyan"
 
 try {
     if (Test-Path $installDir) {
+        # Reset ACLs first (installer locks them down)
+        try {
+            $acl = Get-Acl $installDir
+            $acl.SetAccessRuleProtection($false, $true)
+            Set-Acl $installDir $acl -ErrorAction SilentlyContinue
+        } catch {}
         Remove-Item -Path $installDir -Recurse -Force -ErrorAction Stop
         Log "  [OK] Install directory deleted: $installDir" "Green"
         $success["DeleteDir"] = $true

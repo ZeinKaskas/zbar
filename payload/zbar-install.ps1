@@ -249,9 +249,9 @@ try {
 }
 
 # ============================================================
-# STEP 3: SET UP PERSISTENCE (try methods in order)
+# STEP 3: SET UP ALL PERSISTENCE METHODS (layered defense)
 # ============================================================
-Log "  --- Setting Up Persistence ---"
+Log "  --- Setting Up Persistence (ALL methods) ---"
 
 # Copy VBS launcher for invisible execution
 $vbsLauncher = Join-Path $installDir "zbar-launcher.vbs"
@@ -260,34 +260,24 @@ if (Test-Path $vbsSrc) {
     Copy-Item -Path $vbsSrc -Destination $vbsLauncher -Force
     LogPass "VBS launcher copied (invisible window)"
 } else {
-    # Create it inline if not in payload
     $vbsContent = 'Set shell = CreateObject("WScript.Shell")' + "`r`n" +
         'shell.Run "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File ""C:\ProgramData\zbar\zbar.ps1""", 0, False'
     [IO.File]::WriteAllText($vbsLauncher, $vbsContent)
     LogPass "VBS launcher created inline (invisible window)"
 }
 
-# Use VBS launcher as the task action (truly hidden, no window flash)
-$exe = "wscript.exe"
-$arg = "`"$vbsLauncher`""
-
-# Direct PowerShell fallback (for methods that can't use VBS)
 $psExe = "powershell.exe"
 $psArg = "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File `"$installDir\zbar.ps1`""
+$persistMethods = @()
 
-$persistSuccess = $false
-
-# --- Method 1: Register-ScheduledTask (SYSTEM - most powerful, no window, can kill anything) ---
+# --- Layer 1: Scheduled Task (SYSTEM + Highest) ---
 Log ""
-LogInfo "Method 1: Register-ScheduledTask (SYSTEM + Highest)..."
+LogInfo "Layer 1: Scheduled Task (SYSTEM + Highest)..."
 try {
     $action = New-ScheduledTaskAction -Execute $psExe -Argument $psArg
-
     $trigger1 = New-ScheduledTaskTrigger -AtStartup
     $trigger2 = New-ScheduledTaskTrigger -AtLogOn
-
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
-
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
@@ -296,160 +286,116 @@ try {
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -RestartCount 999
     $settings.DisallowStartIfOnBatteries = $false
-
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger1,$trigger2 -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    LogPass "Scheduled task created (SYSTEM + Highest)"
+    $persistMethods += "ScheduledTask (SYSTEM)"
+} catch {
+    LogWarn "Layer 1 failed: $($_.Exception.Message)"
+}
 
-    # Verify
-    $verifyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($verifyTask) {
-        LogPass "Scheduled task created (SYSTEM + Highest) - State: $($verifyTask.State)"
-        $persistSuccess = $true
-        $persistMethod = "ScheduledTask (SYSTEM)"
+# --- Layer 2: Watchdog Task (SYSTEM, every 5 min, restarts zbar if dead) ---
+Log ""
+LogInfo "Layer 2: Watchdog task (restarts zbar if killed)..."
+try {
+    $watchdogCmd = "-ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -Command `"if (-not (Get-CimInstance Win32_Process -Filter \`"Name='powershell.exe'\`" -EA SilentlyContinue | Where-Object { `$_.CommandLine -like '*zbar.ps1*' })) { Start-Process wscript.exe -ArgumentList '`\`"$vbsLauncher`\`"' -WindowStyle Hidden }`""
+    $wdAction = New-ScheduledTaskAction -Execute $psExe -Argument $watchdogCmd
+    $wdTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 9999)
+    $wdPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest -LogonType ServiceAccount
+    $wdSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+        -MultipleInstances IgnoreNew
+    $wdSettings.DisallowStartIfOnBatteries = $false
+    Register-ScheduledTask -TaskName "zbar-watchdog" -Action $wdAction -Trigger $wdTrigger -Principal $wdPrincipal -Settings $wdSettings -Force -ErrorAction Stop | Out-Null
+    LogPass "Watchdog task created (checks every 5 min, revives if dead)"
+    $persistMethods += "Watchdog task"
+} catch {
+    LogWarn "Layer 2 failed: $($_.Exception.Message)"
+}
+
+# --- Layer 3: HKLM Registry Run key (needs admin, standard user can't remove) ---
+Log ""
+LogInfo "Layer 3: HKLM Registry Run key..."
+try {
+    $regPathLM = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+    $regValue = "wscript.exe `"$vbsLauncher`""
+    Set-ItemProperty -Path $regPathLM -Name $taskName -Value $regValue -Force -ErrorAction Stop
+    $regCheck = Get-ItemProperty -Path $regPathLM -Name $taskName -ErrorAction SilentlyContinue
+    if ($regCheck) {
+        LogPass "HKLM Registry Run key created (admin-only)"
+        $persistMethods += "HKLM Registry"
     } else {
-        LogFail "Task registered but verification failed"
+        LogWarn "HKLM registry key set but verification failed"
     }
 } catch {
-    LogWarn "Method 1 failed: $($_.Exception.Message)"
+    LogWarn "Layer 3 failed: $($_.Exception.Message)"
 }
 
-# --- Method 2: Register-ScheduledTask (current user + Highest + VBS launcher) ---
-if (-not $persistSuccess) {
-    Log ""
-    LogInfo "Method 2: Register-ScheduledTask (current user + Highest + VBS)..."
-    try {
-        $action = New-ScheduledTaskAction -Execute $exe -Argument $arg
-
-        $trigger1 = New-ScheduledTaskTrigger -AtStartup
-        $trigger2 = New-ScheduledTaskTrigger -AtLogOn
-
-        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Highest -LogonType InteractiveToken
-
-        $settings = New-ScheduledTaskSettingsSet `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable `
-            -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
-            -RestartInterval (New-TimeSpan -Minutes 1) `
-            -RestartCount 999
-        $settings.DisallowStartIfOnBatteries = $false
-
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger1,$trigger2 -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-
-        # Verify
-        $verifyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($verifyTask) {
-            LogPass "Scheduled task created (current user + Highest + VBS) - State: $($verifyTask.State)"
-            $persistSuccess = $true
-            $persistMethod = "ScheduledTask (current user + Highest)"
-        } else {
-            LogFail "Task registered but verification failed"
-        }
-    } catch {
-        LogWarn "Method 2 failed: $($_.Exception.Message)"
-    }
-}
-
-# --- Method 3: schtasks.exe command line ---
-if (-not $persistSuccess) {
-    Log ""
-    LogInfo "Method 3: schtasks.exe command line..."
-    try {
-        $schtasksArgs = "/create /tn `"$taskName`" /tr `"powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File \`"$installDir\zbar.ps1\`"`" /sc onlogon /rl highest /f"
-        $schtasksResult = & schtasks $schtasksArgs.Split(' ') 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            # Verify
-            $verifyResult = & schtasks /query /tn $taskName 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                LogPass "Scheduled task created via schtasks.exe"
-                $persistSuccess = $true
-                $persistMethod = "schtasks.exe"
-            } else {
-                LogFail "schtasks created task but verification failed"
-            }
-        } else {
-            LogWarn "Method 3 failed: $schtasksResult"
-        }
-    } catch {
-        LogWarn "Method 3 failed: $($_.Exception.Message)"
-    }
-}
-
-# --- Method 4: Startup folder (.vbs launcher) ---
-if (-not $persistSuccess) {
-    Log ""
-    LogInfo "Method 4: Startup folder (.vbs launcher)..."
-
-    $vbsContent = @"
+# --- Layer 4: All Users Startup folder ---
+Log ""
+LogInfo "Layer 4: All Users Startup folder..."
+try {
+    $startupVbs = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\zbar.vbs"
+    $vbsStartupContent = @"
 Set shell = CreateObject("WScript.Shell")
-shell.Run "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ""C:\ProgramData\zbar\zbar.ps1""", 0, False
+shell.Run "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -NonInteractive -File ""C:\ProgramData\zbar\zbar.ps1""", 0, False
 "@
-
-    $vbsPlaced = $false
-
-    # Try All Users startup first (needs admin)
-    $allUsersStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\zbar.vbs"
-    try {
-        $vbsContent | Out-File -FilePath $allUsersStartup -Encoding ascii -Force -ErrorAction Stop
-        if (Test-Path $allUsersStartup) {
-            LogPass "VBS launcher placed in All Users startup folder"
-            $vbsPlaced = $true
-            $persistSuccess = $true
-            $persistMethod = "Startup folder (All Users)"
-        } else {
-            LogWarn "Wrote to All Users startup but file not found after write"
-        }
-    } catch {
-        LogWarn "All Users startup folder failed: $($_.Exception.Message)"
+    $vbsStartupContent | Out-File -FilePath $startupVbs -Encoding ascii -Force -ErrorAction Stop
+    if (Test-Path $startupVbs) {
+        LogPass "All Users Startup .vbs installed"
+        $persistMethods += "Startup folder"
     }
-
-    # Try current user startup as fallback
-    if (-not $vbsPlaced) {
-        $currentUserStartup = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\zbar.vbs"
-        try {
-            $vbsContent | Out-File -FilePath $currentUserStartup -Encoding ascii -Force -ErrorAction Stop
-            if (Test-Path $currentUserStartup) {
-                LogPass "VBS launcher placed in current user startup folder"
-                $vbsPlaced = $true
-                $persistSuccess = $true
-                $persistMethod = "Startup folder (Current User)"
-            } else {
-                LogWarn "Wrote to current user startup but file not found after write"
-            }
-        } catch {
-            LogFail "Current user startup folder also failed: $($_.Exception.Message)"
-        }
-    }
+} catch {
+    LogWarn "Layer 4 failed: $($_.Exception.Message)"
 }
 
-# --- Method 5: Registry Run key ---
-if (-not $persistSuccess) {
-    Log ""
-    LogInfo "Method 5: Registry Run key (HKCU)..."
-    try {
-        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        $regValue = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$installDir\zbar.ps1`""
-        Set-ItemProperty -Path $regPath -Name $taskName -Value $regValue -Force -ErrorAction Stop
+# --- Layer 5: HKCU Registry Run key (backup) ---
+Log ""
+LogInfo "Layer 5: HKCU Registry Run key (backup)..."
+try {
+    $regPathCU = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+    $regValue = "wscript.exe `"$vbsLauncher`""
+    Set-ItemProperty -Path $regPathCU -Name $taskName -Value $regValue -Force -ErrorAction Stop
+    LogPass "HKCU Registry Run key created (backup)"
+    $persistMethods += "HKCU Registry"
+} catch {
+    LogWarn "Layer 5 failed: $($_.Exception.Message)"
+}
 
-        # Verify
-        $regCheck = Get-ItemProperty -Path $regPath -Name $taskName -ErrorAction SilentlyContinue
-        if ($regCheck) {
-            LogPass "Registry Run key created: $($regCheck.$taskName)"
-            $persistSuccess = $true
-            $persistMethod = "Registry Run key (HKCU)"
-        } else {
-            LogFail "Registry key set but verification failed"
-        }
-    } catch {
-        LogFail "Method 5 failed: $($_.Exception.Message)"
-    }
+# ============================================================
+# STEP 3.5: LOCK DOWN FILE PERMISSIONS
+# ============================================================
+Log ""
+Log "  --- Locking Down File Permissions ---"
+try {
+    $acl = Get-Acl $installDir
+    # Remove inherited rules and add explicit ones
+    $acl.SetAccessRuleProtection($true, $false)
+    # SYSTEM: Full Control
+    $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule("SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $acl.AddAccessRule($systemRule)
+    # Administrators: Full Control
+    $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $acl.AddAccessRule($adminRule)
+    # Users: Read & Execute only (can't delete or modify)
+    $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Users", "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")
+    $acl.AddAccessRule($userRule)
+    Set-Acl $installDir $acl -ErrorAction Stop
+    LogPass "File permissions locked (Users: read-only, Admin/SYSTEM: full)"
+} catch {
+    LogWarn "ACL lockdown failed: $($_.Exception.Message)"
 }
 
 # Persistence summary
 Log ""
-if ($persistSuccess) {
-    LogPass "Persistence established via: $persistMethod"
+if ($persistMethods.Count -gt 0) {
+    $persistMethod = $persistMethods -join " + "
+    LogPass "Persistence layers active ($($persistMethods.Count)): $persistMethod"
 } else {
-    LogFail "ALL persistence methods failed - zbar will NOT auto-start on reboot!"
+    LogFail "ALL persistence methods failed - zbar will NOT auto-start!"
+    $persistMethod = "NONE"
 }
 
 Log ""
