@@ -5,6 +5,8 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $blocklistFile = Join-Path $scriptDir "blocklist.txt"
 $logFile = Join-Path $scriptDir "zbar-log.txt"
 $pidFile = Join-Path $scriptDir "zbar.pid"
+$killScreen = Join-Path $scriptDir "zbar-killscreen.ps1"
+$lastKillScreenTime = [datetime]::MinValue
 
 # Write PID for diagnostics (ASCII so batch can read it)
 [IO.File]::WriteAllText($pidFile, $PID.ToString())
@@ -23,6 +25,11 @@ while ($true) {
                     Stop-Process -Id $proc.Id -Force -ErrorAction Stop
                     "$now  KILLED  $($proc.ProcessName)  (PID $($proc.Id))" |
                         Out-File $logFile -Append -Encoding utf8
+                    # Launch killscreen (max once per 60s)
+                    if ((Test-Path $killScreen) -and ((Get-Date) - $lastKillScreenTime).TotalSeconds -ge 60) {
+                        $lastKillScreenTime = Get-Date
+                        Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$killScreen`" -ProcessName `"$($proc.ProcessName)`""
+                    }
                 } catch {
                     "$now  FAILED  $($proc.ProcessName)  (PID $($proc.Id))  $($_.Exception.Message)" |
                         Out-File $logFile -Append -Encoding utf8
