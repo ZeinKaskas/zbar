@@ -195,7 +195,7 @@ try {
 }
 
 # Copy each file
-$filesToCopy = @("zbar.ps1", "blocklist.txt", "zbar-check.ps1", "zbar-launcher.vbs")
+$filesToCopy = @("zbar.ps1", "blocklist.txt", "zbar-check.ps1", "zbar-launcher.vbs", "zbar-killscreen.ps1")
 $allFilesCopied = $true
 
 foreach ($fileName in $filesToCopy) {
